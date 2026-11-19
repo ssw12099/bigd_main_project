@@ -1,3 +1,11 @@
+"""
+notify_stock_price.py(하루 3회 알림), collect_daily_close.py(하루 1회 종가 수집)가
+공통으로 쓰는 함수 모음.
+
+네이버 금융 비공식 API(m.stock.naver.com)는 장중이면 실시간 체결가를, 장 시작 전/마감
+후에는 가장 최근 종가를 marketStatus/closePrice 필드로 그대로 돌려주므로, 이 하나의
+엔드포인트로 "현재가 조회"와 "일별 종가 기록"을 모두 처리한다.
+"""
 import os
 import io
 import re
@@ -8,19 +16,24 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 # pandas/matplotlib은 read_watchlist()/build_price_chart() 안에서 그때그때 import한다.
-# 파일을 열자마자 무거운 패키지를 읽어들이지 않으려는 것이다.
+# 이 모듈에서 텔레그램 관련 함수만 가져다 쓰는 경우에는 이 두 (설치·로딩이 무거운) 패키지가
+# 아예 필요 없는데, 모듈 최상단에서 import하면 그런 경우에도 강제로 설치돼 있어야 한다.
 
 WATCHLIST_FILE = "watchlist.csv"
 NUM_HISTORY_DAYS = 15
-# 시간대를 명시하지 않으면 실행 환경에 따라 날짜가 하루 어긋날 수 있다. 항상 이 KST를 기준으로 쓴다.
+# 시간대를 명시하지 않으면 실행 환경에 따라 날짜가 하루 어긋날 수 있다(특히 밤늦게 실행할 때).
+# 항상 이 KST를 명시해서 기준 시간대를 고정한다.
 KST = ZoneInfo("Asia/Seoul")
 
+# 이 모듈이 임포트되는 시점에 바로 .env를 로드해야, 아래 os.environ.get() 호출이
+# 호출 스크립트의 import 순서와 무관하게 항상 올바른 값을 읽는다.
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
 
 def read_watchlist(path: str = WATCHLIST_FILE) -> list:
     """watchlist.csv를 읽어 종목코드 리스트를 반환합니다. 실패 시 None."""
@@ -51,6 +64,117 @@ def read_watchlist(path: str = WATCHLIST_FILE) -> list:
     except Exception as e:
         print(f"❌ CSV 파일을 읽는 동안 오류가 발생했습니다: {e}")
         return None
+
+
+def get_turso_client():
+    """Turso(libSQL) DB 클라이언트를 생성하고, price_history 테이블이 없으면 만듭니다.
+    libsql_client는 여기서만 필요한 무거운(네트워크 연결) 의존성이라 모듈 최상단이 아니라
+    이 함수 안에서 import한다 (pandas/matplotlib과 동일한 이유, 파일 상단 주석 참고).
+
+    collect_daily_close.py처럼 종목을 여러 번 순회하며 저장하는 경우, 이 함수를 매번 새로
+    부르지 않고 한 번만 호출해 얻은 클라이언트를 update_price_history()의 client 인자로
+    넘겨 재사용할 수 있다 — 그러면 종목마다 새 연결을 맺고 이 CREATE TABLE을 반복하지 않는다."""
+    import libsql_client
+
+    if not TURSO_DATABASE_URL:
+        raise RuntimeError("TURSO_DATABASE_URL 환경변수가 설정되지 않았습니다.")
+
+    # turso db show --url이 돌려주는 libsql:// 스킴은 WebSocket(wss://)으로 연결되는데,
+    # 학교/사내 방화벽이나 일부 실행 환경에서 WebSocket이 막혀 있으면 에러조차 없이 그냥
+    # 멈춰버린다(타임아웃 없이 무한 대기). transaction() API를 쓰지 않아 HTTP만으로도 충분하므로,
+    # 항상 https://로 바꿔 접속해 이 문제를 원천적으로 피한다.
+    # .replace(old, new, 1)의 마지막 1은 "맨 앞 1개만 바꾸라"는 뜻이다 (문자열 안에 libsql://가
+    # 또 나올 일은 없지만, 관례적으로 몇 번까지 바꿀지 명시해두면 의도가 분명해진다).
+    url = TURSO_DATABASE_URL.replace("libsql://", "https://", 1)
+    client = libsql_client.create_client_sync(url, auth_token=TURSO_AUTH_TOKEN)
+    # IF NOT EXISTS: 테이블이 이미 있으면 아무 일도 안 하고, 없을 때만 새로 만든다 — 이 함수가
+    # 여러 번 호출돼도(스크립트를 여러 번 실행해도) 안전하다.
+    # 스키마: code(종목코드)+date(YYYYMMDD)를 합쳐 하나의 행을 유일하게 식별하는 기본키(PRIMARY
+    # KEY)로 지정 — "같은 종목의 같은 날짜"는 딱 하나의 행만 존재할 수 있다는 제약이다.
+    client.execute(
+        "CREATE TABLE IF NOT EXISTS price_history ("
+        "code TEXT NOT NULL, date TEXT NOT NULL, close INTEGER NOT NULL, "
+        "PRIMARY KEY (code, date))"
+    )
+    return client
+
+
+def load_price_history() -> dict:
+    """Turso DB에서 종목별 종가 히스토리를 읽어 {code: [{"date": "YYYYMMDD", "close": 가격}, ...]}
+    형태(날짜 오름차순)로 반환합니다. 예전에는 이 함수가 price_history.json 파일을 읽었지만,
+    Turso로 옮긴 뒤로는 DB에서 직접 SELECT한다."""
+    try:
+        # with 문(컨텍스트 매니저): 블록이 끝나면(정상 종료든 예외든) client.close()가 자동으로
+        # 호출되어 DB 연결이 확실히 정리된다 — 파일을 open()으로 열었을 때와 같은 원리다.
+        with get_turso_client() as client:
+            # ORDER BY code, date: 종목코드 순으로, 같은 종목 안에서는 날짜 오름차순으로 정렬해서
+            # 받아온다 (그래프를 그릴 때 날짜순 정렬이 이미 돼 있어야 하므로 여기서 미리 정렬한다).
+            result = client.execute("SELECT code, date, close FROM price_history ORDER BY code, date")
+    except Exception as e:
+        print(f"❌ Turso DB에서 종가 히스토리를 읽지 못했습니다: {e}")
+        return {}
+
+    history: dict = {}
+    # result.rows는 (code, date, close) 튜플들의 목록이다. for 문에서 (code, date, close)로 바로
+    # 풀어서(unpacking) 받는다.
+    for code, date, close in result.rows:
+        # dict.setdefault(key, [])는 "key가 이미 있으면 그 값을 그대로 쓰고, 없으면 빈 리스트를
+        # 새로 만들어 넣은 뒤 그걸 반환"한다 — 종목별로 리스트를 매번 존재 확인하며 만드는 코드
+        # (if code not in history: history[code] = []) 를 한 줄로 줄인 것이다.
+        history.setdefault(code, []).append({"date": date, "close": close})
+    return history
+
+
+def update_price_history(code: str, date_str: str, close_price: int,
+                          num_days: int = NUM_HISTORY_DAYS, client=None) -> None:
+    """종목의 종가 히스토리에 오늘자 종가를 Turso DB에 즉시 저장합니다. 같은 날짜가 이미 있으면
+    덮어쓰고, 종목별로 최근 num_days개만 남기고 오래된 행은 삭제합니다.
+
+    JSON 파일 방식과 달리 이 함수 호출 자체가 DB에 바로 반영되므로(트랜잭션 커밋), 예전의
+    load_price_history() → 메모리에서 수정 → save_price_history()로 파일 통째로 다시 쓰기 같은
+    별도의 "저장" 단계가 필요 없다 — 이것이 파일 기반 저장과 DB 기반 저장의 핵심 차이다.
+
+    client를 안 넘기면(기본값 None) 이 함수가 알아서 하나 만들고 끝나면 스스로 닫는다 — 종목을
+    한 번만 저장할 때 쓰는 방식. collect_daily_close.py처럼 여러 종목을 순회하며 반복 호출할
+    때는, 호출부가 get_turso_client()로 미리 만들어둔 클라이언트를 client 인자로 넘겨서 종목마다
+    새 연결을 맺지 않고 재사용할 수 있다 — 이때는 클라이언트를 만든 쪽(호출부)이 닫을 책임을
+    지므로, 이 함수는 그 클라이언트를 닫지 않는다."""
+    # own_client: 이 함수가 클라이언트를 직접 만들었는지(True) 아니면 밖에서 받았는지(False).
+    # 직접 만든 경우에만 이 함수가 끝날 때 스스로 닫아야 한다 — 밖에서 받은 클라이언트를 여기서
+    # 닫아버리면, 호출부가 다음 종목을 처리할 때 이미 닫힌 연결을 쓰려다 에러가 난다.
+    own_client = client is None
+    if own_client:
+        client = get_turso_client()
+    try:
+        # "?"는 SQL 쿼리의 자리표시자(placeholder)다. 문자열을 f"...{code}..."처럼 직접
+        # 끼워넣지 않고 별도의 리스트로 값을 넘기면, 라이브러리가 안전하게 값을 채워준다
+        # (SQL 인젝션 방지 — 종목코드/날짜에 이상한 문자가 섞여 있어도 쿼리 구조가 깨지지 않는다).
+        #
+        # ON CONFLICT (code, date) DO UPDATE: "upsert"라고 부르는 패턴이다. (code, date)가
+        # PRIMARY KEY라서 이미 같은 조합의 행이 있으면 INSERT가 충돌(conflict)나는데, 이 경우
+        # 새로 넣는 대신 close 값만 덮어쓴다(UPDATE) — "있으면 수정, 없으면 추가"를 SQL 한
+        # 문장으로 처리한다. excluded.close는 "이번에 넣으려던 새 close 값"을 가리킨다.
+        client.execute(
+            "INSERT INTO price_history (code, date, close) VALUES (?, ?, ?) "
+            "ON CONFLICT (code, date) DO UPDATE SET close = excluded.close",
+            [code, date_str, close_price],
+        )
+        # 이 종목(code)의 최근 num_days개보다 오래된 행을 지워 히스토리 길이를 일정하게 유지한다.
+        # 안쪽 SELECT가 먼저 "날짜 내림차순으로 정렬해 최신 num_days개의 날짜"를 뽑고,
+        # 바깥쪽 DELETE는 그 목록에 없는(NOT IN) 나머지 오래된 행만 지운다 — "남길 것"을 먼저
+        # 정하고 "그 외 전부"를 지우는 서브쿼리 활용 패턴이다.
+        client.execute(
+            "DELETE FROM price_history WHERE code = ? AND date NOT IN ("
+            "SELECT date FROM price_history WHERE code = ? ORDER BY date DESC LIMIT ?)",
+            [code, code, num_days],
+        )
+    except Exception as e:
+        print(f"❌ [{code}] Turso DB에 종가 저장 실패: {e}")
+    finally:
+        # own_client일 때만(이 함수가 직접 만들었을 때만) 닫는다 — finally라서 위에서 예외가
+        # 나도 반드시 실행된다(연결이 계속 열린 채로 남는 걸 방지).
+        if own_client:
+            client.close()
 
 
 def fetch_naver_current_price(code: str, retries: int = 2) -> dict:
@@ -228,6 +352,26 @@ def format_rate_badge(price: int, rate: float) -> str:
     return f"{prefix} ▫️ 0.0%"
 
 
+def resolve_today_price(price: int, is_open: bool, intraday_minutes: list,
+                        daily_closes: list) -> int:
+    """분봉/현재가 조회 결과로 build_price_chart()에 넘길 "오늘" 가격을 결정합니다. 장이
+    닫혀있고(is_open=False) 분봉도 없으면(장마감 후~다음 장 시작 전) 지금 조회한 가격은
+    DB의 마지막 종가와 같은 값이 필연적이므로 None을 돌려줘, "오늘" 점을 따로 안 그리게
+    합니다. 단 daily_closes(과거 종가)가 하나도 없으면 비교할 대상 자체가 없으므로 이 예외는
+    적용하지 않고 현재가를 그대로 살립니다. notify_stock_price.py/dashboard.py가 공유합니다."""
+    # 삼항 표현식(조건부 표현식): "조건이 참이면 price, 거짓이면 None"을 한 줄로 쓴 것.
+    # is_open이 True(장중)면 무조건 살아있는 값이라 그대로 쓰고, is_open이 False라도
+    # intraday_minutes가 비어있지 않으면(장마감 직후라 분봉은 남아있는 경우) 마찬가지로 살려둔다.
+    # 세 번째 조건(not daily_closes)은 "지금 가격은 마지막 종가와 중복이라 뺀다"는 위 근거가
+    # 언제 성립하는지를 따진 것이다 — 비교할 과거 종가가 하나도 없으면 중복될 값 자체가 없으므로
+    # 그 근거가 성립하지 않는다. 이때 현재가는 그 종목의 유일한 데이터이므로 반드시 살려야 하고,
+    # 버리면 그릴 점이 하나도 없어 축과 격자만 있는 빈 그래프가 만들어진다. 새로 추가한 종목이나
+    # collect_daily_close.py가 아직 한 번도 실행되지 않은 최초 실행에서 이 상황이 생긴다.
+    # 위 셋 다 아니면(장마감 후~다음 장 시작 전, 히스토리는 있음) None을 돌려준다. 빈 리스트([])는
+    # 파이썬에서 False로 취급되므로 intraday_minutes/daily_closes만 써도 "비어있는지" 확인이 된다.
+    return price if (is_open or intraday_minutes or not daily_closes) else None
+
+
 def dedupe_daily_closes(daily_closes: list, today_price: int, intraday_minutes: list) -> list:
     """daily_closes에 오늘 날짜 종가가 섞여 있어도, 분봉/현재가로 "오늘" 구간을 따로 보여줄
     때는(today_price가 있거나 intraday_minutes가 있으면) 제외한 리스트를 반환합니다.
@@ -385,132 +529,3 @@ def build_price_chart(daily_closes: list, current_price: int = None,
     # 되돌려야, 이 버퍼를 읽는 쪽(sendPhoto, st.image 등)이 처음부터 제대로 읽을 수 있다.
     buffer.seek(0)
     return buffer
-
-def get_turso_client():
-    """Turso(libSQL) DB 클라이언트를 생성하고, price_history 테이블이 없으면 만듭니다.
-    libsql_client는 여기서만 필요한 무거운(네트워크 연결) 의존성이라 모듈 최상단이 아니라
-    이 함수 안에서 import한다 (pandas/matplotlib과 동일한 이유, 파일 상단 주석 참고).
-
-    collect_daily_close.py처럼 종목을 여러 번 순회하며 저장하는 경우, 이 함수를 매번 새로
-    부르지 않고 한 번만 호출해 얻은 클라이언트를 update_price_history()의 client 인자로
-    넘겨 재사용할 수 있다 — 그러면 종목마다 새 연결을 맺고 이 CREATE TABLE을 반복하지 않는다."""
-    import libsql_client
-
-    if not TURSO_DATABASE_URL:
-        raise RuntimeError("TURSO_DATABASE_URL 환경변수가 설정되지 않았습니다.")
-
-    # turso db show --url이 돌려주는 libsql:// 스킴은 WebSocket(wss://)으로 연결되는데,
-    # 학교/사내 방화벽이나 일부 실행 환경에서 WebSocket이 막혀 있으면 에러조차 없이 그냥
-    # 멈춰버린다(타임아웃 없이 무한 대기). transaction() API를 쓰지 않아 HTTP만으로도 충분하므로,
-    # 항상 https://로 바꿔 접속해 이 문제를 원천적으로 피한다.
-    # .replace(old, new, 1)의 마지막 1은 "맨 앞 1개만 바꾸라"는 뜻이다 (문자열 안에 libsql://가
-    # 또 나올 일은 없지만, 관례적으로 몇 번까지 바꿀지 명시해두면 의도가 분명해진다).
-    url = TURSO_DATABASE_URL.replace("libsql://", "https://", 1)
-    client = libsql_client.create_client_sync(url, auth_token=TURSO_AUTH_TOKEN)
-    # IF NOT EXISTS: 테이블이 이미 있으면 아무 일도 안 하고, 없을 때만 새로 만든다 — 이 함수가
-    # 여러 번 호출돼도(스크립트를 여러 번 실행해도) 안전하다.
-    # 스키마: code(종목코드)+date(YYYYMMDD)를 합쳐 하나의 행을 유일하게 식별하는 기본키(PRIMARY
-    # KEY)로 지정 — "같은 종목의 같은 날짜"는 딱 하나의 행만 존재할 수 있다는 제약이다.
-    client.execute(
-        "CREATE TABLE IF NOT EXISTS price_history ("
-        "code TEXT NOT NULL, date TEXT NOT NULL, close INTEGER NOT NULL, "
-        "PRIMARY KEY (code, date))"
-    )
-    return client
-
-
-def update_price_history(code: str, date_str: str, close_price: int,
-                          num_days: int = NUM_HISTORY_DAYS, client=None) -> None:
-    """종목의 종가 히스토리에 오늘자 종가를 Turso DB에 즉시 저장합니다. 같은 날짜가 이미 있으면
-    덮어쓰고, 종목별로 최근 num_days개만 남기고 오래된 행은 삭제합니다.
-
-    JSON 파일 방식과 달리 이 함수 호출 자체가 DB에 바로 반영되므로(트랜잭션 커밋), 예전의
-    load_price_history() → 메모리에서 수정 → save_price_history()로 파일 통째로 다시 쓰기 같은
-    별도의 "저장" 단계가 필요 없다 — 이것이 파일 기반 저장과 DB 기반 저장의 핵심 차이다.
-
-    client를 안 넘기면(기본값 None) 이 함수가 알아서 하나 만들고 끝나면 스스로 닫는다 — 종목을
-    한 번만 저장할 때 쓰는 방식. collect_daily_close.py처럼 여러 종목을 순회하며 반복 호출할
-    때는, 호출부가 get_turso_client()로 미리 만들어둔 클라이언트를 client 인자로 넘겨서 종목마다
-    새 연결을 맺지 않고 재사용할 수 있다 — 이때는 클라이언트를 만든 쪽(호출부)이 닫을 책임을
-    지므로, 이 함수는 그 클라이언트를 닫지 않는다."""
-    # own_client: 이 함수가 클라이언트를 직접 만들었는지(True) 아니면 밖에서 받았는지(False).
-    # 직접 만든 경우에만 이 함수가 끝날 때 스스로 닫아야 한다 — 밖에서 받은 클라이언트를 여기서
-    # 닫아버리면, 호출부가 다음 종목을 처리할 때 이미 닫힌 연결을 쓰려다 에러가 난다.
-    own_client = client is None
-    if own_client:
-        client = get_turso_client()
-    try:
-        # "?"는 SQL 쿼리의 자리표시자(placeholder)다. 문자열을 f"...{code}..."처럼 직접
-        # 끼워넣지 않고 별도의 리스트로 값을 넘기면, 라이브러리가 안전하게 값을 채워준다
-        # (SQL 인젝션 방지 — 종목코드/날짜에 이상한 문자가 섞여 있어도 쿼리 구조가 깨지지 않는다).
-        #
-        # ON CONFLICT (code, date) DO UPDATE: "upsert"라고 부르는 패턴이다. (code, date)가
-        # PRIMARY KEY라서 이미 같은 조합의 행이 있으면 INSERT가 충돌(conflict)나는데, 이 경우
-        # 새로 넣는 대신 close 값만 덮어쓴다(UPDATE) — "있으면 수정, 없으면 추가"를 SQL 한
-        # 문장으로 처리한다. excluded.close는 "이번에 넣으려던 새 close 값"을 가리킨다.
-        client.execute(
-            "INSERT INTO price_history (code, date, close) VALUES (?, ?, ?) "
-            "ON CONFLICT (code, date) DO UPDATE SET close = excluded.close",
-            [code, date_str, close_price],
-        )
-        # 이 종목(code)의 최근 num_days개보다 오래된 행을 지워 히스토리 길이를 일정하게 유지한다.
-        # 안쪽 SELECT가 먼저 "날짜 내림차순으로 정렬해 최신 num_days개의 날짜"를 뽑고,
-        # 바깥쪽 DELETE는 그 목록에 없는(NOT IN) 나머지 오래된 행만 지운다 — "남길 것"을 먼저
-        # 정하고 "그 외 전부"를 지우는 서브쿼리 활용 패턴이다.
-        client.execute(
-            "DELETE FROM price_history WHERE code = ? AND date NOT IN ("
-            "SELECT date FROM price_history WHERE code = ? ORDER BY date DESC LIMIT ?)",
-            [code, code, num_days],
-        )
-    except Exception as e:
-        print(f"❌ [{code}] Turso DB에 종가 저장 실패: {e}")
-    finally:
-        # own_client일 때만(이 함수가 직접 만들었을 때만) 닫는다 — finally라서 위에서 예외가
-        # 나도 반드시 실행된다(연결이 계속 열린 채로 남는 걸 방지).
-        if own_client:
-            client.close()
-
-
-def resolve_today_price(price: int, is_open: bool, intraday_minutes: list,
-                        daily_closes: list) -> int:
-    """분봉/현재가 조회 결과로 build_price_chart()에 넘길 "오늘" 가격을 결정합니다. 장이
-    닫혀있고(is_open=False) 분봉도 없으면(장마감 후~다음 장 시작 전) 지금 조회한 가격은
-    DB의 마지막 종가와 같은 값이 필연적이므로 None을 돌려줘, "오늘" 점을 따로 안 그리게
-    합니다. 단 daily_closes(과거 종가)가 하나도 없으면 비교할 대상 자체가 없으므로 이 예외는
-    적용하지 않고 현재가를 그대로 살립니다. notify_stock_price.py/dashboard.py가 공유합니다."""
-    # 삼항 표현식(조건부 표현식): "조건이 참이면 price, 거짓이면 None"을 한 줄로 쓴 것.
-    # is_open이 True(장중)면 무조건 살아있는 값이라 그대로 쓰고, is_open이 False라도
-    # intraday_minutes가 비어있지 않으면(장마감 직후라 분봉은 남아있는 경우) 마찬가지로 살려둔다.
-    # 세 번째 조건(not daily_closes)은 "지금 가격은 마지막 종가와 중복이라 뺀다"는 위 근거가
-    # 언제 성립하는지를 따진 것이다 — 비교할 과거 종가가 하나도 없으면 중복될 값 자체가 없으므로
-    # 그 근거가 성립하지 않는다. 이때 현재가는 그 종목의 유일한 데이터이므로 반드시 살려야 하고,
-    # 버리면 그릴 점이 하나도 없어 축과 격자만 있는 빈 그래프가 만들어진다. 새로 추가한 종목이나
-    # collect_daily_close.py가 아직 한 번도 실행되지 않은 최초 실행에서 이 상황이 생긴다.
-    # 위 셋 다 아니면(장마감 후~다음 장 시작 전, 히스토리는 있음) None을 돌려준다. 빈 리스트([])는
-    # 파이썬에서 False로 취급되므로 intraday_minutes/daily_closes만 써도 "비어있는지" 확인이 된다.
-    return price if (is_open or intraday_minutes or not daily_closes) else None
-
-def load_price_history() -> dict:
-    """Turso DB에서 종목별 종가 히스토리를 읽어 {code: [{"date": "YYYYMMDD", "close": 가격}, ...]}
-    형태(날짜 오름차순)로 반환합니다. 예전에는 이 함수가 price_history.json 파일을 읽었지만,
-    Turso로 옮긴 뒤로는 DB에서 직접 SELECT한다."""
-    try:
-        # with 문(컨텍스트 매니저): 블록이 끝나면(정상 종료든 예외든) client.close()가 자동으로
-        # 호출되어 DB 연결이 확실히 정리된다 — 파일을 open()으로 열었을 때와 같은 원리다.
-        with get_turso_client() as client:
-            # ORDER BY code, date: 종목코드 순으로, 같은 종목 안에서는 날짜 오름차순으로 정렬해서
-            # 받아온다 (그래프를 그릴 때 날짜순 정렬이 이미 돼 있어야 하므로 여기서 미리 정렬한다).
-            result = client.execute("SELECT code, date, close FROM price_history ORDER BY code, date")
-    except Exception as e:
-        print(f"❌ Turso DB에서 종가 히스토리를 읽지 못했습니다: {e}")
-        return {}
-
-    history: dict = {}
-    # result.rows는 (code, date, close) 튜플들의 목록이다. for 문에서 (code, date, close)로 바로
-    # 풀어서(unpacking) 받는다.
-    for code, date, close in result.rows:
-        # dict.setdefault(key, [])는 "key가 이미 있으면 그 값을 그대로 쓰고, 없으면 빈 리스트를
-        # 새로 만들어 넣은 뒤 그걸 반환"한다 — 종목별로 리스트를 매번 존재 확인하며 만드는 코드
-        # (if code not in history: history[code] = []) 를 한 줄로 줄인 것이다.
-        history.setdefault(code, []).append({"date": date, "close": close})
-    return history
