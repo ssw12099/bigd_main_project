@@ -8,10 +8,34 @@ collect_daily_close.py가 미리 저장해 둔 Turso DB의 최근 15거래일 �
 send_price_notification()으로 알림 로직 전체를 함수 하나에 감싸 두었다.
 `python notify_stock_price.py`로 직접 실행하면 그 함수가 그대로 실행된다.
 
+--- 알림이 안 왔을 때 원인 찾는 법 ---
+
+"텔레그램이 안 왔다"는 사실 하나만으로는 원인을 알 수 없다. 원인이 여러 개인데 겉으로는
+똑같이 "조용함"으로만 보이기 때문이다. 그래서 **GitHub Actions 실행 결과를 같이 봐야**
+한다 (저장소 → Actions 탭 → "관심종목 현재가 알림"):
+
+  텔레그램    Actions             해석
+  ---------------------------------------------------------------------------
+  안 옴       실행 기록이 아예 없음   스케줄이 통째로 스킵됨. GitHub Actions의 알려진
+                                  신뢰성 한계이고 가장 흔한 원인이다. 내 잘못이 아니므로
+                                  cron 문법을 의심하며 파고들지 말 것.
+  안 옴       빨간 ✗ (실패)        실행은 됐는데 아무것도 못 했다. 로그의 ❌ 문구로
+                                  네이버 조회 실패인지 텔레그램 전송 실패인지 구분한다.
+  안 옴       녹색 ✓ (성공)        공휴일이라 보낼 게 없었던 정상 종료다.
+
+세 번째 줄이 "공휴일 하나"로 확정되는 건 이 스크립트가 **아무것도 못 했으면 반드시 종료
+코드 1로 끝나기** 때문이다(맨 아래 __main__ 블록 참고). 예전에는 조회에 전부 실패하거나
+텔레그램 전송에 전부 실패해도 종료 코드 0으로 끝나서 Actions에 녹색 체크만 남았고, 그
+경우와 공휴일이 구분되지 않았다. 녹색 체크가 "정상 동작 중"이라고 잘못 알려주던 셈이라
+침묵보다 나빴다.
+
+(같은 표를 더 자세히 풀어 쓴 것이 FAQ.md 2절 2번에 있다.)
 """
 import html
+import sys
 
 from stock_utils import (
+    is_trading_day,
     read_watchlist,
     load_price_history,
     fetch_naver_current_price,
@@ -33,6 +57,10 @@ def send_price_notification() -> bool:
     못했으면 False를 반환합니다. 여기서 "아무것도 하지 못했다"에는 조회에 전부 실패한 경우뿐
     아니라 조회는 됐는데 텔레그램 전송이 전부 실패한 경우도 포함됩니다.
     """
+    if not is_trading_day():
+        print("📅 오늘은 KRX 개장일이 아닙니다 (주말/공휴일). 알림을 건너뜁니다.")
+        return True  # 휴장일은 실패가 아니라 보낼 게 없는 정상 종료다.
+
     watchlist_codes = read_watchlist()
     if watchlist_codes is None:
         return False
@@ -100,7 +128,7 @@ def send_price_notification() -> bool:
                   f"collect_daily_close.py가 아직 한 번도 실행되지 않았을 수 있습니다.")
 
         intraday_minutes = intraday_by_code[code]
-        # resolve_today_price(): 분봉도 없고 장도 닫혀있으면(장마감 후~다음 장 시작 전) 지금
+        # resolve_today_price(): 분봉도 없고 장도 닫혀있으면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전) 지금
         # 조회한 "현재가"는 daily_closes의 마지막 종가와 필연적으로 같은 값이라 None을 돌려받는다
         # — build_price_chart()가 None을 받으면 "오늘" 점을 따로 안 그려서 중복 표시를 막는다.
         # daily_closes도 같이 넘기는 이유: 히스토리가 비어 있으면 중복될 종가 자체가 없으므로
@@ -136,4 +164,20 @@ def send_price_notification() -> bool:
 # 다른 스크립트가 `from notify_stock_price import send_price_notification`처럼 함수만
 # 가져다 쓰는 경우에는 이 블록이 자동으로 실행되지 않는다.
 if __name__ == "__main__":
-    send_price_notification()
+    # 아무것도 못 보냈으면 종료 코드 1로 끝내, GitHub Actions가 이 실행을 "실패"로 표시하게 한다.
+    # 0으로 끝나면 녹색 체크만 남아 네이버 차단 같은 장애를 알아챌 수 없다.
+    #
+    # send_price_notification()의 반환값 → 종료 코드 대응:
+    #   휴장일          → True  → 0   (보낼 게 없는 정상 종료. 실패가 아니다)
+    #   watchlist 실패   → False → 1   (관심종목 파일을 못 읽어 아무것도 못 함)
+    #   전 종목 조회 실패 → False → 1   (네이버가 막힌 경우가 대표적)
+    #   전 종목 전송 실패 → False → 1   (봇 토큰 만료·텔레그램 장애)
+    #   정상 완료        → True  → 0
+    #
+    # 단 "일부만" 실패한 부분 실패는 조회든 전송이든 여기 해당하지 않는다 — 나머지 종목은
+    # 정상적으로 조회·전송됐으므로 실패가 아니라고 보고 그대로 0으로 끝낸다(로그에는 ❌로 남는다).
+    # sys.exit(n): 프로그램을 즉시 끝내면서 운영체제에 n을 "종료 코드"로 알려준다.
+    # 관례적으로 0은 성공, 0이 아닌 값은 실패를 뜻하고 GitHub Actions도 이 값으로 성패를 판단한다.
+    # 이 종료 코드를 실제 장애 진단에 어떻게 쓰는지는 파일 맨 위 docstring의
+    # "알림이 안 왔을 때 원인 찾는 법" 참고.
+    sys.exit(0 if send_price_notification() else 1)

@@ -11,6 +11,7 @@ import io
 import re
 import time
 import requests
+import holidays
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -21,8 +22,8 @@ from dotenv import load_dotenv
 
 WATCHLIST_FILE = "watchlist.csv"
 NUM_HISTORY_DAYS = 15
-# 시간대를 명시하지 않으면 실행 환경에 따라 날짜가 하루 어긋날 수 있다(특히 밤늦게 실행할 때).
-# 항상 이 KST를 명시해서 기준 시간대를 고정한다.
+# GitHub Actions 실행 환경은 UTC라 datetime.now()(naive)를 그대로 쓰면 스케줄 시각이 아닌
+# 수동/야간 실행 시 날짜가 하루 어긋날 수 있다. 항상 이 KST를 명시해서 기준 시간대를 고정한다.
 KST = ZoneInfo("Asia/Seoul")
 
 # 이 모듈이 임포트되는 시점에 바로 .env를 로드해야, 아래 os.environ.get() 호출이
@@ -33,6 +34,23 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
+# holidays.KR()은 한국 공휴일 날짜(datetime.date 객체)들을 담고 있는 특수한 집합(set)이다.
+# "날짜 in _KR_HOLIDAYS"처럼 in 연산자로 그 날짜가 공휴일인지 바로 물어볼 수 있다.
+_KR_HOLIDAYS = holidays.KR()
+
+
+def is_trading_day(date: datetime = None) -> bool:
+    """평일이면서 한국 공휴일이 아닌 날(=KRX 개장일)인지 확인합니다."""
+    # 함수를 호출할 때 date를 안 넘기면(None) 지금 이 순간(오늘, KST 기준)을 기준으로 판단한다.
+    date = date or datetime.now(KST)
+    # datetime.weekday()는 월요일=0, 화요일=1, ... 일요일=6을 반환한다.
+    # 5(토요일) 이상이면 주말이라는 뜻이므로 거래일이 아니다.
+    if date.weekday() >= 5:  # 5=토요일, 6=일요일
+        return False
+    # datetime(날짜+시각)에서 시각 정보를 뺀 date(날짜만)로 변환해야 holidays 집합과 비교할 수 있다.
+    # "not in"이므로 "공휴일 목록에 없으면 True(거래일)"라는 뜻이다.
+    return date.date() not in _KR_HOLIDAYS
 
 
 def read_watchlist(path: str = WATCHLIST_FILE) -> list:
@@ -355,19 +373,19 @@ def format_rate_badge(price: int, rate: float) -> str:
 def resolve_today_price(price: int, is_open: bool, intraday_minutes: list,
                         daily_closes: list) -> int:
     """분봉/현재가 조회 결과로 build_price_chart()에 넘길 "오늘" 가격을 결정합니다. 장이
-    닫혀있고(is_open=False) 분봉도 없으면(장마감 후~다음 장 시작 전) 지금 조회한 가격은
+    닫혀있고(is_open=False) 분봉도 없으면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전) 지금 조회한 가격은
     DB의 마지막 종가와 같은 값이 필연적이므로 None을 돌려줘, "오늘" 점을 따로 안 그리게
     합니다. 단 daily_closes(과거 종가)가 하나도 없으면 비교할 대상 자체가 없으므로 이 예외는
     적용하지 않고 현재가를 그대로 살립니다. notify_stock_price.py/dashboard.py가 공유합니다."""
     # 삼항 표현식(조건부 표현식): "조건이 참이면 price, 거짓이면 None"을 한 줄로 쓴 것.
     # is_open이 True(장중)면 무조건 살아있는 값이라 그대로 쓰고, is_open이 False라도
-    # intraday_minutes가 비어있지 않으면(장마감 직후라 분봉은 남아있는 경우) 마찬가지로 살려둔다.
+    # intraday_minutes가 비어있지 않으면(애프터마켓 마감 직후라 분봉은 남아있는 경우) 마찬가지로 살려둔다.
     # 세 번째 조건(not daily_closes)은 "지금 가격은 마지막 종가와 중복이라 뺀다"는 위 근거가
     # 언제 성립하는지를 따진 것이다 — 비교할 과거 종가가 하나도 없으면 중복될 값 자체가 없으므로
     # 그 근거가 성립하지 않는다. 이때 현재가는 그 종목의 유일한 데이터이므로 반드시 살려야 하고,
     # 버리면 그릴 점이 하나도 없어 축과 격자만 있는 빈 그래프가 만들어진다. 새로 추가한 종목이나
     # collect_daily_close.py가 아직 한 번도 실행되지 않은 최초 실행에서 이 상황이 생긴다.
-    # 위 셋 다 아니면(장마감 후~다음 장 시작 전, 히스토리는 있음) None을 돌려준다. 빈 리스트([])는
+    # 위 셋 다 아니면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전, 히스토리는 있음) None을 돌려준다. 빈 리스트([])는
     # 파이썬에서 False로 취급되므로 intraday_minutes/daily_closes만 써도 "비어있는지" 확인이 된다.
     return price if (is_open or intraday_minutes or not daily_closes) else None
 
@@ -380,7 +398,7 @@ def dedupe_daily_closes(daily_closes: list, today_price: int, intraday_minutes: 
     막습니다."""
     # today_price가 None(오늘 값 없음)이고 intraday_minutes도 비어있으면(둘 다 없음) "오늘"
     # 구간을 아예 안 그리는 상황이므로, 걸러낼 필요 없이 원본 daily_closes를 그대로 돌려준다 —
-    # 이 경우 DB에 저장된 오늘 종가가 있어도(장마감 후 이미 수집된 경우) 정보 손실 없이 보여준다.
+    # 이 경우 DB에 저장된 오늘 종가가 있어도(애프터마켓 마감 뒤 이미 수집된 경우) 정보 손실 없이 보여준다.
     if today_price is None and not intraday_minutes:
         return daily_closes
     # 위 조건에 안 걸렸다는 건 "오늘" 구간을 실제로 따로 그린다는 뜻이므로, daily_closes 안에
@@ -408,7 +426,7 @@ def build_price_chart(daily_closes: list, current_price: int = None,
     intraday_minutes를 넘기면(오늘 분봉, 시간 오름차순) 오늘 구간을 분 단위 선으로 그리고,
     없으면 current_price 한 점만 표시합니다. current_price도 None이면(네이버 API 조회가
     실패한 경우) "오늘" 지점 없이 daily_closes만으로 그립니다 — 이 경우 daily_closes에
-    이미 오늘 종가가 들어있어도(장마감 후 collect_daily_close.py가 실행된 뒤라면) 그대로 표시되어
+    이미 오늘 종가가 들어있어도(애프터마켓 마감 뒤 collect_daily_close.py가 실행된 뒤라면) 그대로 표시되어
     정보 손실이 없습니다. 반대로 분봉/현재가 조회에 성공하면, daily_closes에 오늘 날짜 종가가
     섞여 있어도 제외하고 그립니다 — "오늘" 구간과 중복 표시되는 것을 막기 위해서입니다."""
     import matplotlib
